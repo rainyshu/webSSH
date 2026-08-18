@@ -27,4 +27,17 @@ public class PageController {
     public String loginPage() {
         return "forward:/login.html";
     }
+
+    /**
+     * 处理注册页面的请求，将 /register 路径转发到 register.html 静态页面。
+     * <p>
+     * 与登录页保持一致的转发策略，使地址栏呈现简洁的 /register，且与 Security 白名单路径对应。
+     * </p>
+     *
+     * @return 视图名称 "forward:/register.html"，指示 Spring 进行内部转发
+     */
+    @GetMapping("/register")
+    public String registerPage() {
+        return "forward:/register.html";
+    }
 }

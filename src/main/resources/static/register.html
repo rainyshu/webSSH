@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title data-i18n="page.login.title">Web SSH 登录</title>
+    <title data-i18n="page.register.title">Web SSH 注册</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -21,7 +21,7 @@
             <line x1="2" y1="12" x2="22" y2="12"></line>
             <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
         </svg>
-        <select id="loginLanguageSelect" aria-label="Language"></select>
+        <select id="registerLanguageSelect" aria-label="Language"></select>
     </div>
 
     <div class="card">
@@ -35,10 +35,10 @@
                 </svg>
             </div>
             <h1>WebSSH</h1>
-            <p class="desc" data-i18n="login.desc">安全终端 · 随时连接</p>
+            <p class="desc" data-i18n="register.desc">创建账号 · 开启终端</p>
         </div>
 
-        <form method="post" action="/login">
+        <form id="registerForm" novalidate>
             <div class="input-group">
                 <div class="input-icon">
                     <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5"
@@ -47,8 +47,8 @@
                         <circle cx="12" cy="7" r="4"></circle>
                     </svg>
                 </div>
-                <input type="text" name="username" data-i18n-placeholder="login.usernamePlaceholder" placeholder="用户名"
-                    autocomplete="username" required>
+                <input type="text" id="username" name="username" data-i18n-placeholder="register.usernamePlaceholder"
+                    placeholder="用户名（3-32 位字母、数字、_.-）" autocomplete="username" required>
             </div>
 
             <div class="input-group">
@@ -59,12 +59,28 @@
                         <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
                     </svg>
                 </div>
-                <input type="password" name="password" data-i18n-placeholder="login.passwordPlaceholder" placeholder="密码"
-                    autocomplete="current-password" required>
+                <input type="password" id="password" name="password" data-i18n-placeholder="register.passwordPlaceholder"
+                    placeholder="密码（至少 6 位）" autocomplete="new-password" required>
             </div>
 
-            <button type="submit">
-                <span class="btn-text" data-i18n="login.submit">登录</span>
+            <div class="input-group">
+                <div class="input-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M9 12l2 2 4-4"></path>
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                </div>
+                <input type="password" id="confirmPassword" name="confirmPassword"
+                    data-i18n-placeholder="register.confirmPasswordPlaceholder" placeholder="确认密码"
+                    autocomplete="new-password" required>
+            </div>
+
+            <div class="form-message" id="formMessage" role="alert" aria-live="polite"></div>
+
+            <button type="submit" id="submitButton">
+                <span class="btn-text" data-i18n="register.submit">注册</span>
                 <span class="btn-icon">
                     <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -76,27 +92,107 @@
         </form>
 
         <div class="hint">
-            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"
-                stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="16" x2="12" y2="12"></line>
-                <line x1="12" y1="8" x2="12.01" y2="8"></line>
-            </svg>
-            <span data-i18n="login.defaultAccount">默认账号</span> <code>admin / admin123</code>
-        </div>
-
-        <div class="hint">
-            <span data-i18n="login.noAccount">还没有账号？</span>
-            <a class="text-link" href="/register" data-i18n="login.gotoRegister">立即注册</a>
+            <span data-i18n="register.hasAccount">已有账号？</span>
+            <a class="text-link" href="/login" data-i18n="register.gotoLogin">返回登录</a>
         </div>
     </div>
 
     <script src="/i18n.js"></script>
     <script>
-        if (window.webSshI18n) {
-            window.webSshI18n.applyTranslations();
-            window.webSshI18n.mountLanguageSelector(document.getElementById('loginLanguageSelect'));
+        const i18n = window.webSshI18n;
+        const t = (key, params) => (i18n ? i18n.t(key, params) : key);
+
+        if (i18n) {
+            i18n.applyTranslations();
+            i18n.mountLanguageSelector(document.getElementById('registerLanguageSelect'));
         }
+
+        const form = document.getElementById('registerForm');
+        const usernameInput = document.getElementById('username');
+        const passwordInput = document.getElementById('password');
+        const confirmInput = document.getElementById('confirmPassword');
+        const messageBox = document.getElementById('formMessage');
+        const submitButton = document.getElementById('submitButton');
+        const USERNAME_PATTERN = /^[a-zA-Z0-9._-]{3,32}$/;
+        let redirecting = false;
+
+        function showMessage(text, type) {
+            messageBox.textContent = text;
+            messageBox.className = 'form-message visible ' + type;
+        }
+
+        function clearMessage() {
+            messageBox.textContent = '';
+            messageBox.className = 'form-message';
+        }
+
+        // 语言切换后重新渲染当前提示，避免残留旧语言文本
+        window.addEventListener('webssh:languagechange', () => {
+            if (!redirecting) {
+                clearMessage();
+            }
+        });
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            clearMessage();
+
+            const username = usernameInput.value.trim();
+            const password = passwordInput.value;
+            const confirmPassword = confirmInput.value;
+
+            if (!USERNAME_PATTERN.test(username)) {
+                showMessage(t('register.error.usernameInvalid'), 'error');
+                usernameInput.focus();
+                return;
+            }
+            if (password.length < 6 || password.length > 72) {
+                showMessage(t('register.error.passwordLength'), 'error');
+                passwordInput.focus();
+                return;
+            }
+            if (password !== confirmPassword) {
+                showMessage(t('register.error.passwordMismatch'), 'error');
+                confirmInput.focus();
+                return;
+            }
+
+            submitButton.disabled = true;
+            try {
+                const response = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password, confirmPassword })
+                });
+
+                if (!response.ok) {
+                    let message = '';
+                    try {
+                        const data = await response.json();
+                        message = data && data.message ? data.message : '';
+                    } catch (ignored) {
+                        message = '';
+                    }
+                    // 后端消息为中文，交给 i18n 回译；无消息时退回通用失败文案
+                    const translated = message && i18n && i18n.translateKnownMessage
+                        ? i18n.translateKnownMessage(message)
+                        : message;
+                    showMessage(translated || t('register.error.failed'), 'error');
+                    return;
+                }
+
+                redirecting = true;
+                showMessage(t('register.success'), 'success');
+                submitButton.disabled = true;
+                setTimeout(() => { window.location.href = '/login'; }, 1200);
+            } catch (error) {
+                showMessage(t('register.error.network'), 'error');
+            } finally {
+                if (!redirecting) {
+                    submitButton.disabled = false;
+                }
+            }
+        });
 
         // 动态网格背景
         const canvas = document.getElementById('gridCanvas');
