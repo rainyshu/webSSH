@@ -1,25 +1,18 @@
 package com.webssh.session;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 /**
  * 会话配置持久化服务。
  * <p>
- * 负责按用户隔离的 JSON 文件读写、会话的 CRUD 操作、凭据的加密存储和解密读取，
- * 以及用户级别的并发锁控制，避免同一用户并发写导致数据损坏。
+ * 负责会话配置的数据库 CRUD、凭据的加密存储与解密读取。所有查询与删除都带上
+ * ownerUsername 条件，实现用户级数据隔离，防止越权访问他人的会话。
  * </p>
  * <p>
  * {@link NormalizedRequest} 内部记录类用于校验和规范化输入，确保存储前数据合法且格式统一。
@@ -28,28 +21,18 @@ import java.util.concurrent.ConcurrentMap;
 @Service
 public class SessionProfileStore {
 
-    /** Jackson 反序列化 JSON 为 Profile 列表的类型引用 */
-    private static final TypeReference<List<StoredSshSessionProfile>> PROFILE_LIST =
-            new TypeReference<>() {};
-
-    private final ObjectMapper objectMapper;
-    private final Path rootDir;
+    private final SessionProfileRepository repository;
     private final CredentialCryptoService cryptoService;
-    /** 按用户名分组的锁，同一用户串行化读写，不同用户可并行 */
-    private final ConcurrentMap<String, Object> locks = new ConcurrentHashMap<>();
 
     /**
      * 构造会话存储服务。
      *
-     * @param objectMapper    用于 JSON 序列化/反序列化
-     * @param properties      存储目录配置
-     * @param cryptoService  凭据加解密服务
+     * @param repository    会话配置数据访问接口
+     * @param cryptoService 凭据加解密服务
      */
-    public SessionProfileStore(ObjectMapper objectMapper,
-                               SessionStoreProperties properties,
+    public SessionProfileStore(SessionProfileRepository repository,
                                CredentialCryptoService cryptoService) {
-        this.objectMapper = objectMapper;
-        this.rootDir = Paths.get(properties.getDirectory()).toAbsolutePath().normalize();
+        this.repository = repository;
         this.cryptoService = cryptoService;
     }
 
@@ -59,14 +42,21 @@ public class SessionProfileStore {
      * @param username 用户名
      * @return 按更新时间倒序排列的会话列表，不含 password/privateKey/passphrase
      */
+    @Transactional(readOnly = true)
     public List<SshSessionProfile> list(String username) {
-        synchronized (lockFor(username)) {
-            List<StoredSshSessionProfile> stored = sorted(readProfiles(username));
+        if (isBlank(username)) {
+            return new ArrayList<>();
+        }
+        try {
+            List<StoredSshSessionProfile> stored =
+                    repository.findByOwnerUsernameOrderByUpdatedAtDesc(username);
             List<SshSessionProfile> result = new ArrayList<>();
             for (StoredSshSessionProfile profile : stored) {
                 result.add(toSummary(profile));
             }
             return result;
+        } catch (DataAccessException e) {
+            throw new IllegalStateException("读取会话配置失败: " + e.getMessage(), e);
         }
     }
 
@@ -77,13 +67,17 @@ public class SessionProfileStore {
      * @param id       会话 ID
      * @return 会话详情，含解密后的 password/privateKey/passphrase；不存在则返回 null
      */
+    @Transactional(readOnly = true)
     public SshSessionProfile get(String username, String id) {
-        if (id == null || id.isBlank()) {
+        if (isBlank(username) || isBlank(id)) {
             return null;
         }
-        synchronized (lockFor(username)) {
-            StoredSshSessionProfile found = findById(readProfiles(username), id);
-            return found == null ? null : toDetail(found);
+        try {
+            return repository.findByOwnerUsernameAndId(username, id)
+                    .map(this::toDetail)
+                    .orElse(null);
+        } catch (DataAccessException e) {
+            throw new IllegalStateException("读取会话配置失败: " + e.getMessage(), e);
         }
     }
 
@@ -97,20 +91,17 @@ public class SessionProfileStore {
      * @param profile  会话配置（可为新建或更新）
      * @return 保存后的会话摘要（不含凭据明文）
      */
+    @Transactional
     public SshSessionProfile save(String username, SshSessionProfile profile) {
         NormalizedRequest request = normalizeRequest(profile);
-        synchronized (lockFor(username)) {
-            List<StoredSshSessionProfile> profiles = readProfiles(username);
-            int index = findIndexById(profiles, request.id());
-            StoredSshSessionProfile existing = index >= 0 ? profiles.get(index) : null;
-            StoredSshSessionProfile stored = toStored(request, existing);
-            if (index >= 0) {
-                profiles.set(index, stored);
-            } else {
-                profiles.add(stored);
-            }
-            writeProfiles(username, profiles);
-            return toSummary(stored);
+        try {
+            // 仅在归属本人时才视为“更新已有会话”，否则按新建处理，避免覆盖他人数据
+            StoredSshSessionProfile existing =
+                    repository.findByOwnerUsernameAndId(username, request.id()).orElse(null);
+            StoredSshSessionProfile stored = toStored(username, request, existing);
+            return toSummary(repository.save(stored));
+        } catch (DataAccessException e) {
+            throw new IllegalStateException("保存会话配置失败: " + e.getMessage(), e);
         }
     }
 
@@ -121,107 +112,16 @@ public class SessionProfileStore {
      * @param id       会话 ID
      * @return 是否成功删除
      */
+    @Transactional
     public boolean delete(String username, String id) {
-        if (id == null || id.isBlank()) {
+        if (isBlank(username) || isBlank(id)) {
             return false;
         }
-        synchronized (lockFor(username)) {
-            List<StoredSshSessionProfile> profiles = readProfiles(username);
-            boolean removed = profiles.removeIf(p -> id.equals(p.getId()));
-            if (removed) {
-                writeProfiles(username, profiles);
-            }
-            return removed;
-        }
-    }
-
-    /**
-     * 获取指定用户的独占锁，用于串行化该用户的读写操作。
-     * 使用 computeIfAbsent 保证每个用户名对应唯一锁对象。
-     *
-     * @param username 用户名
-     * @return 该用户对应的锁对象
-     */
-    private Object lockFor(String username) {
-        return locks.computeIfAbsent(username, ignored -> new Object());
-    }
-
-    /**
-     * 从磁盘读取指定用户的会话配置列表。
-     *
-     * @param username 用户名
-     * @return 会话列表，文件不存在或为空时返回空列表
-     */
-    private List<StoredSshSessionProfile> readProfiles(String username) {
-        Path file = fileOf(username);
-        if (!Files.exists(file)) {
-            return new ArrayList<>();
-        }
         try {
-            List<StoredSshSessionProfile> profiles = objectMapper.readValue(file.toFile(), PROFILE_LIST);
-            return profiles == null ? new ArrayList<>() : new ArrayList<>(profiles);
-        } catch (IOException e) {
-            throw new IllegalStateException("读取会话配置失败: " + e.getMessage(), e);
-        }
-    }
-
-    /**
-     * 将会话配置列表写入磁盘。
-     *
-     * @param username 用户名
-     * @param profiles 会话列表
-     */
-    private void writeProfiles(String username, List<StoredSshSessionProfile> profiles) {
-        Path file = fileOf(username);
-        try {
-            Files.createDirectories(rootDir);
-            objectMapper.writerWithDefaultPrettyPrinter().writeValue(file.toFile(), sorted(profiles));
-        } catch (IOException e) {
+            return repository.deleteByOwnerUsernameAndId(username, id) > 0;
+        } catch (DataAccessException e) {
             throw new IllegalStateException("保存会话配置失败: " + e.getMessage(), e);
         }
-    }
-
-    /**
-     * 根据用户名解析存储文件路径。
-     * 将用户名中的非法文件名字符替换为下划线，防止路径遍历等安全问题。
-     *
-     * @param username 用户名
-     * @return 该用户对应的 JSON 文件路径
-     */
-    private Path fileOf(String username) {
-        String safe = username.replaceAll("[^a-zA-Z0-9._-]", "_");
-        return rootDir.resolve(safe + ".json");
-    }
-
-    /**
-     * 按更新时间倒序排序，最新修改的排在前面。
-     *
-     * @param input 原始列表
-     * @return 排序后的列表（原地修改并返回）
-     */
-    private List<StoredSshSessionProfile> sorted(List<StoredSshSessionProfile> input) {
-        input.sort(Comparator.comparingLong(StoredSshSessionProfile::getUpdatedAt).reversed());
-        return input;
-    }
-
-    /** 在列表中按 ID 查找会话，未找到返回 null */
-    private StoredSshSessionProfile findById(List<StoredSshSessionProfile> profiles, String id) {
-        for (StoredSshSessionProfile profile : profiles) {
-            if (id.equals(profile.getId())) {
-                return profile;
-            }
-        }
-        return null;
-    }
-
-    /** 在列表中按 ID 查找索引，未找到返回 -1 */
-    private int findIndexById(List<StoredSshSessionProfile> profiles, String id) {
-        for (int i = 0; i < profiles.size(); i++) {
-            if (id.equals(profiles.get(i).getId())) {
-                return i;
-            }
-        }
-        return -1;
     }
 
     /**
@@ -231,14 +131,17 @@ public class SessionProfileStore {
      * 但已有存储的加密凭据，则复用已有凭据（避免用户仅修改名称等时清空密码）。
      * </p>
      *
-     * @param request  已校验的请求
-     * @param existing 同 ID 的已有实体，新建时为 null
-     * @return 可写入磁盘的 StoredSshSessionProfile
+     * @param ownerUsername 归属用户名，用于数据隔离
+     * @param request       已校验的请求
+     * @param existing      同 ID 且归属同一用户的已有实体，新建时为 null
+     * @return 可写入数据库的 StoredSshSessionProfile
      */
-    private StoredSshSessionProfile toStored(NormalizedRequest request,
+    private StoredSshSessionProfile toStored(String ownerUsername,
+                                             NormalizedRequest request,
                                              StoredSshSessionProfile existing) {
         StoredSshSessionProfile stored = new StoredSshSessionProfile();
         stored.setId(request.id());
+        stored.setOwnerUsername(ownerUsername);
         stored.setName(request.name());
         stored.setHost(request.host());
         stored.setPort(request.port());

@@ -48,6 +48,16 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-websocket</artifactId>
         </dependency>
+        <!-- Spring Data JPA：以实体 + Repository 方式访问 MySQL，持久化用户账号与 SSH 会话配置 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <!-- MySQL 驱动：连接 rainy-common-ssh 数据库 -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+        </dependency>
         <!-- JSch (mwiede 维护版)：Java SSH 客户端库，用于建立 SSH 连接、执行命令、传输文件等 -->
         <dependency>
             <groupId>com.github.mwiede</groupId>
@@ -59,6 +69,15 @@
             <groupId>org.telegram</groupId>
             <artifactId>telegrambots</artifactId>
             <version>6.9.7.1</version>
+            <exclusions>
+                <!-- 排除 javax 版 JAXB 注解模块：其缺少 javax.xml.bind API，会导致 Hibernate
+                     初始化 JacksonJsonFormatMapper 时抛 NoClassDefFoundError。
+                     Spring Boot 3 使用 jakarta 版模块，无需该 legacy 模块。 -->
+                <exclusion>
+                    <groupId>com.fasterxml.jackson.module</groupId>
+                    <artifactId>jackson-module-jaxb-annotations</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <!-- Spring Boot Test：测试依赖，包含 JUnit、Mockito、Spring Test 等，仅用于测试阶段 -->
         <dependency>

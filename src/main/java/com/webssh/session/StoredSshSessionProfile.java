@@ -1,36 +1,73 @@
 package com.webssh.session;
 
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Lob;
+import jakarta.persistence.Table;
+
 /**
- * 持久化存储的 SSH 会话配置实体。
+ * 持久化存储的 SSH 会话配置实体，对应数据库表 {@code webssh_session_profile}。
  * <p>
- * 与 {@link SshSessionProfile} 不同，本类用于磁盘存储和内部处理，敏感字段
+ * 与 {@link SshSessionProfile} 不同，本类用于数据库存储和内部处理，敏感字段
  * （password、privateKey、passphrase）以加密形式存储在 encryptedXxx 字段中，
- * 确保 JSON 文件中不出现明文凭据。
+ * 确保数据库中不出现明文凭据。
  * </p>
  */
+@Entity
+@Table(name = "webssh_session_profile")
 public class StoredSshSessionProfile {
 
-    /** 会话唯一标识 */
+    /** 会话唯一标识（UUID，由应用生成） */
+    @Id
+    @Column(name = "id", nullable = false, length = 64)
     private String id;
+
+    /** 归属的登录用户名，用于按用户隔离数据 */
+    @Column(name = "owner_username", nullable = false, length = 32)
+    private String ownerUsername;
+
     /** 会话显示名称 */
+    @Column(name = "name", nullable = false, length = 128)
     private String name;
+
     /** SSH 服务器主机地址 */
+    @Column(name = "host", nullable = false, length = 255)
     private String host;
+
     /** SSH 端口，默认 22 */
+    @Column(name = "port", nullable = false)
     private int port = 22;
+
     /** SSH 登录用户名 */
+    @Column(name = "username", nullable = false, length = 128)
     private String username;
+
     /** 认证方式：PASSWORD 或 PRIVATE_KEY */
+    @Column(name = "auth_type", nullable = false, length = 16)
     private String authType;
+
     /** 主机公钥指纹 */
+    @Column(name = "host_fingerprint", length = 128)
     private String hostFingerprint;
+
     /** 最后更新时间戳（毫秒） */
+    @Column(name = "updated_at", nullable = false)
     private long updatedAt;
+
     /** 加密后的密码，格式为 v1$base64(iv)$base64(encrypted) */
+    @Lob
+    @Column(name = "encrypted_password")
     private String encryptedPassword;
+
     /** 加密后的私钥内容 */
+    @Lob
+    @Column(name = "encrypted_private_key")
     private String encryptedPrivateKey;
+
     /** 加密后的私钥 passphrase */
+    @Lob
+    @Column(name = "encrypted_passphrase")
     private String encryptedPassphrase;
 
     /** @return 会话唯一标识 */
@@ -41,6 +78,16 @@ public class StoredSshSessionProfile {
     /** @param id 会话唯一标识 */
     public void setId(String id) {
         this.id = id;
+    }
+
+    /** @return 归属的登录用户名 */
+    public String getOwnerUsername() {
+        return ownerUsername;
+    }
+
+    /** @param ownerUsername 归属的登录用户名 */
+    public void setOwnerUsername(String ownerUsername) {
+        this.ownerUsername = ownerUsername;
     }
 
     /** @return 会话显示名称 */
