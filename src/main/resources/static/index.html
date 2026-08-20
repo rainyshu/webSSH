@@ -704,6 +704,15 @@
                 <div id="tabs" class="tabs-container">
                     <!-- Tabs will be injected here -->
                 </div>
+                <button id="monitorToggleBtn" class="small-btn" data-i18n-title="monitor.toggleTitle"
+                    title="切换服务器监控面板">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M3 3v18h18"></path>
+                        <polyline points="7 14 11 9 14 12 19 5"></polyline>
+                    </svg>
+                    <span data-i18n="monitor.title">监控</span>
+                </button>
                 <button id="sftpToggleBtn" class="small-btn" data-i18n-title="toolbar.toggleSftpTitle"
                     title="切换 SFTP 面板">
                     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
@@ -732,12 +741,114 @@
                 </button>
             </div>
             <div class="workspace-shell">
-                <div id="terminalContainer" class="terminal-container">
-                    <!-- Terminal panes will be injected here -->
-                    <div id="terminalContextMenu" class="terminal-context-menu" role="menu" aria-hidden="true">
-                        <button type="button" data-action="copy" role="menuitem" data-i18n="common.copy">复制</button>
-                        <button type="button" data-action="paste" role="menuitem" data-i18n="common.paste">粘贴</button>
+                <div class="workspace-row">
+                    <div id="terminalContainer" class="terminal-container">
+                        <!-- Terminal panes will be injected here -->
+                        <div id="terminalContextMenu" class="terminal-context-menu" role="menu" aria-hidden="true">
+                            <button type="button" data-action="copy" role="menuitem"
+                                data-i18n="common.copy">复制</button>
+                            <button type="button" data-action="paste" role="menuitem"
+                                data-i18n="common.paste">粘贴</button>
+                        </div>
                     </div>
+                    <aside id="monitorPanel" class="monitor-panel">
+                        <div class="monitor-head">
+                            <span class="monitor-title">
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M3 3v18h18"></path>
+                                    <polyline points="7 14 11 9 14 12 19 5"></polyline>
+                                </svg>
+                                <span data-i18n="monitor.title">监控</span>
+                            </span>
+                            <span id="monitorState" class="monitor-state monitor-state-idle"
+                                data-i18n="monitor.state.idle">未连接</span>
+                            <button id="monitorCloseBtn" class="small-btn" type="button"
+                                data-i18n-title="monitor.closeTitle" title="关闭监控面板">
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                                </svg>
+                            </button>
+                        </div>
+                        <div id="monitorBody" class="monitor-body">
+                            <div id="monitorHint" class="monitor-hint" data-i18n="monitor.hint.idle">连接服务器后自动开始采集</div>
+                            <div id="monitorMetrics" class="monitor-metrics" hidden>
+                                <section class="monitor-card">
+                                    <div class="monitor-card-head">
+                                        <span data-i18n="monitor.cpu">CPU</span>
+                                        <span id="monitorCpuValue" class="monitor-card-value">--</span>
+                                    </div>
+                                    <div class="monitor-bar">
+                                        <div id="monitorCpuBar" class="monitor-bar-fill"></div>
+                                    </div>
+                                    <div id="monitorCpuMeta" class="monitor-card-meta">--</div>
+                                </section>
+                                <section class="monitor-card">
+                                    <div class="monitor-card-head">
+                                        <span data-i18n="monitor.memory">内存</span>
+                                        <span id="monitorMemValue" class="monitor-card-value">--</span>
+                                    </div>
+                                    <div class="monitor-bar">
+                                        <div id="monitorMemBar" class="monitor-bar-fill"></div>
+                                    </div>
+                                    <div id="monitorMemMeta" class="monitor-card-meta">--</div>
+                                </section>
+                                <section class="monitor-card">
+                                    <div class="monitor-card-head">
+                                        <span data-i18n="monitor.swap">Swap</span>
+                                        <span id="monitorSwapValue" class="monitor-card-value">--</span>
+                                    </div>
+                                    <div class="monitor-bar">
+                                        <div id="monitorSwapBar" class="monitor-bar-fill"></div>
+                                    </div>
+                                    <div id="monitorSwapMeta" class="monitor-card-meta">--</div>
+                                </section>
+                                <section class="monitor-card">
+                                    <div class="monitor-card-head">
+                                        <span data-i18n="monitor.network">网络</span>
+                                    </div>
+                                    <div class="monitor-kv-list">
+                                        <div class="monitor-kv">
+                                            <span data-i18n="monitor.download">下行</span>
+                                            <span id="monitorRxSpeed">--</span>
+                                        </div>
+                                        <div class="monitor-kv">
+                                            <span data-i18n="monitor.upload">上行</span>
+                                            <span id="monitorTxSpeed">--</span>
+                                        </div>
+                                        <div class="monitor-kv">
+                                            <span data-i18n="monitor.totalReceived">累计接收</span>
+                                            <span id="monitorRxTotal">--</span>
+                                        </div>
+                                        <div class="monitor-kv">
+                                            <span data-i18n="monitor.totalSent">累计发送</span>
+                                            <span id="monitorTxTotal">--</span>
+                                        </div>
+                                    </div>
+                                </section>
+                                <section class="monitor-card">
+                                    <div class="monitor-card-head">
+                                        <span data-i18n="monitor.disk">磁盘</span>
+                                    </div>
+                                    <div id="monitorDiskList" class="monitor-disk-list"></div>
+                                </section>
+                                <section class="monitor-card">
+                                    <div class="monitor-kv-list">
+                                        <div class="monitor-kv">
+                                            <span data-i18n="monitor.uptime">运行时长</span>
+                                            <span id="monitorUptime">--</span>
+                                        </div>
+                                        <div class="monitor-kv">
+                                            <span data-i18n="monitor.updatedAt">更新时间</span>
+                                            <span id="monitorUpdatedAt">--</span>
+                                        </div>
+                                    </div>
+                                </section>
+                            </div>
+                        </div>
+                    </aside>
                 </div>
                 <div id="sftpPanel" class="sftp-panel">
                     <div class="sftp-panel-head">

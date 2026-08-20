@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.webssh.config.ResourceGovernanceProperties;
 import com.webssh.config.SshCompatibilityProperties;
+import com.jcraft.jsch.ChannelExec;
 import com.jcraft.jsch.ChannelShell;
 import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.HostKey;
@@ -107,6 +108,28 @@ public class SshWebSocketHandler extends TextWebSocketHandler {
 
     /** 当远端未提供 UTF-8 locale 时，默认兜底值 */
     private static final String DEFAULT_SHELL_UTF8_LOCALE = "en_US.UTF-8";
+
+    /** 服务器监控采集命令的最大执行时长（毫秒） */
+    private static final long MONITOR_EXEC_TIMEOUT_MS = 8_000L;
+
+    /** 服务器监控采集命令输出的最大字节数，防止异常主机返回超大内容 */
+    private static final int MONITOR_OUTPUT_LIMIT_BYTES = 256 * 1024;
+
+    /**
+     * 服务器监控采集脚本：一次 exec 读取 CPU、内存、网络、磁盘、负载等原始数据。
+     * <p>
+     * 全部读取 /proc 下的伪文件与 df 输出，开销极低且不依赖 top 等格式易变的命令。
+     * 各段以 {@code #SECTION} 分隔，由 {@link #parseMonitorOutput} 解析。
+     * </p>
+     */
+    private static final String MONITOR_COMMAND = String.join("; ",
+            "echo '#CPU'; head -n 1 /proc/stat 2>/dev/null",
+            "echo '#CORES'; grep -c '^processor' /proc/cpuinfo 2>/dev/null",
+            "echo '#LOAD'; cat /proc/loadavg 2>/dev/null",
+            "echo '#UPTIME'; cat /proc/uptime 2>/dev/null",
+            "echo '#MEM'; cat /proc/meminfo 2>/dev/null",
+            "echo '#NET'; cat /proc/net/dev 2>/dev/null",
+            "echo '#DISK'; df -P -k 2>/dev/null");
 
 
     /**
@@ -320,6 +343,8 @@ public class SshWebSocketHandler extends TextWebSocketHandler {
                 case "port_forward_add" -> handlePortForwardAdd(connection, payload);
                 case "port_forward_remove" -> handlePortForwardRemove(connection, payload);
                 case "port_forward_list" -> handlePortForwardList(connection);
+                // 监控采集同样是阻塞 IO（远端 exec），复用 SFTP 线程池异步执行
+                case "monitor_stats" -> handleMonitorStats(connection);
                 default -> sendError(session, "不支持的消息类型: " + type);
             }
         } catch (Exception e) {
@@ -1061,6 +1086,356 @@ public class SshWebSocketHandler extends TextWebSocketHandler {
             return;
         }
         sendPortForwardList(connection.webSocketSession(), null, connection.forwardsSnapshot());
+    }
+
+    // ==================== 服务器监控采集 ====================
+
+    /**
+     * 处理 "monitor_stats" 消息 —— 采集远端服务器的 CPU / 内存 / 网络 / 磁盘指标。
+     * <p>
+     * 采集通过独立的 exec 通道执行，不会污染用户正在使用的 Shell 通道。
+     * 若上一次采集尚未结束（网络缓慢等），本次请求直接丢弃，避免任务堆积。
+     * </p>
+     */
+    private void handleMonitorStats(ClientConnection connection) {
+        if (!connection.hasSessionConnected()) {
+            sendError(connection.webSocketSession(), "SSH 尚未连接，无法读取监控数据。");
+            return;
+        }
+        if (!connection.beginMonitorSampling()) {
+            return;
+        }
+        boolean submitted = submitSftpTask(connection, "服务器监控采集", () -> {
+            try {
+                collectMonitorStats(connection);
+            } finally {
+                connection.endMonitorSampling();
+            }
+        });
+        if (!submitted) {
+            connection.endMonitorSampling();
+        }
+    }
+
+    /** 在 exec 通道上执行采集脚本，并把解析结果推送给前端 */
+    private void collectMonitorStats(ClientConnection connection) {
+        Session session = connection.sshSession();
+        if (session == null || !session.isConnected()) {
+            return;
+        }
+
+        String output;
+        try {
+            output = execForOutput(session, MONITOR_COMMAND);
+        } catch (Exception e) {
+            sendMonitorUnavailable(connection.webSocketSession(), "监控数据采集失败: " + safeMessage(e));
+            return;
+        }
+
+        ObjectNode stats = parseMonitorOutput(connection, output);
+        if (stats == null) {
+            sendMonitorUnavailable(connection.webSocketSession(), "当前服务器不支持读取 /proc 监控数据。");
+            return;
+        }
+        sendJson(connection.webSocketSession(), stats);
+    }
+
+    /**
+     * 在指定 SSH 会话上打开临时 exec 通道执行命令，并返回标准输出。
+     * <p>
+     * 采用轮询读取 + 截止时间的方式，避免会话无超时设置时读操作永久阻塞。
+     * </p>
+     */
+    private String execForOutput(Session session, String command) throws Exception {
+        ChannelExec channel = (ChannelExec) session.openChannel("exec");
+        try {
+            channel.setCommand(command);
+            channel.setPty(false);
+            channel.setErrStream(null, true);
+            InputStream in = channel.getInputStream();
+            channel.connect(5_000);
+
+            java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+            long deadline = System.currentTimeMillis() + MONITOR_EXEC_TIMEOUT_MS;
+            while (true) {
+                drainAvailable(in, buffer);
+                if (channel.isClosed()) {
+                    drainAvailable(in, buffer);
+                    break;
+                }
+                if (System.currentTimeMillis() > deadline) {
+                    break;
+                }
+                Thread.sleep(50);
+            }
+            return buffer.toString(StandardCharsets.UTF_8);
+        } finally {
+            try {
+                channel.disconnect();
+            } catch (Exception ignored) {
+                // 忽略关闭异常
+            }
+        }
+    }
+
+    /** 把输入流中当前可读的数据排空到缓冲区，超过上限时抛出异常 */
+    private void drainAvailable(InputStream in, java.io.ByteArrayOutputStream buffer) throws IOException {
+        byte[] chunk = new byte[8192];
+        while (in.available() > 0) {
+            int read = in.read(chunk);
+            if (read < 0) {
+                return;
+            }
+            if (buffer.size() + read > MONITOR_OUTPUT_LIMIT_BYTES) {
+                throw new IOException("监控数据输出超出上限");
+            }
+            buffer.write(chunk, 0, read);
+        }
+    }
+
+    /**
+     * 解析监控采集脚本输出，计算 CPU 使用率与网络速率并组装下行 JSON。
+     *
+     * @return 组装好的消息节点；当输出无法识别（如非 Linux 主机）时返回 null
+     */
+    private ObjectNode parseMonitorOutput(ClientConnection connection, String output) {
+        if (!hasText(output)) {
+            return null;
+        }
+
+        String section = "";
+        long cpuTotal = 0L;
+        long cpuIdle = 0L;
+        boolean cpuParsed = false;
+        int cores = 0;
+        double load1 = -1D;
+        double load5 = -1D;
+        double load15 = -1D;
+        double uptimeSeconds = -1D;
+        long memTotal = 0L;
+        long memFree = 0L;
+        long memAvailable = -1L;
+        long memBuffers = 0L;
+        long memCached = 0L;
+        long swapTotal = 0L;
+        long swapFree = 0L;
+        boolean memParsed = false;
+        long rxBytes = 0L;
+        long txBytes = 0L;
+        boolean netParsed = false;
+        ArrayNode disks = objectMapper.createArrayNode();
+
+        for (String rawLine : output.split("\n")) {
+            String line = rawLine.trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            if (line.startsWith("#")) {
+                section = line.substring(1);
+                continue;
+            }
+
+            if ("CPU".equals(section)) {
+                if (!line.startsWith("cpu")) {
+                    continue;
+                }
+                String[] fields = line.split("\\s+");
+                long total = 0L;
+                for (int i = 1; i < fields.length; i++) {
+                    long value = parseLongOrDefault(fields[i], -1L);
+                    if (value < 0) {
+                        continue;
+                    }
+                    total += value;
+                    // 第 4、5 列分别是 idle 与 iowait，均视为空闲时间
+                    if (i == 4 || i == 5) {
+                        cpuIdle += value;
+                    }
+                }
+                cpuTotal = total;
+                cpuParsed = total > 0;
+            } else if ("CORES".equals(section)) {
+                cores = (int) Math.max(0L, parseLongOrDefault(line, 0L));
+            } else if ("LOAD".equals(section)) {
+                String[] fields = line.split("\\s+");
+                if (fields.length >= 3) {
+                    load1 = parseDoubleOrDefault(fields[0], -1D);
+                    load5 = parseDoubleOrDefault(fields[1], -1D);
+                    load15 = parseDoubleOrDefault(fields[2], -1D);
+                }
+            } else if ("UPTIME".equals(section)) {
+                String[] fields = line.split("\\s+");
+                if (fields.length >= 1) {
+                    uptimeSeconds = parseDoubleOrDefault(fields[0], -1D);
+                }
+            } else if ("MEM".equals(section)) {
+                int colon = line.indexOf(':');
+                if (colon <= 0) {
+                    continue;
+                }
+                String key = line.substring(0, colon).trim();
+                long valueKb = parseLongOrDefault(line.substring(colon + 1).trim().split("\\s+")[0], -1L);
+                if (valueKb < 0) {
+                    continue;
+                }
+                long valueBytes = valueKb * 1024L;
+                switch (key) {
+                    case "MemTotal" -> {
+                        memTotal = valueBytes;
+                        memParsed = true;
+                    }
+                    case "MemFree" -> memFree = valueBytes;
+                    case "MemAvailable" -> memAvailable = valueBytes;
+                    case "Buffers" -> memBuffers = valueBytes;
+                    case "Cached" -> memCached = valueBytes;
+                    case "SwapTotal" -> swapTotal = valueBytes;
+                    case "SwapFree" -> swapFree = valueBytes;
+                    default -> {
+                        // 其他指标不需要
+                    }
+                }
+            } else if ("NET".equals(section)) {
+                int colon = line.indexOf(':');
+                if (colon <= 0 || line.contains("|")) {
+                    continue;
+                }
+                String iface = line.substring(0, colon).trim();
+                if ("lo".equals(iface) || iface.startsWith("docker") || iface.startsWith("veth")
+                        || iface.startsWith("br-")) {
+                    continue;
+                }
+                String[] fields = line.substring(colon + 1).trim().split("\\s+");
+                if (fields.length < 9) {
+                    continue;
+                }
+                long rx = parseLongOrDefault(fields[0], -1L);
+                long tx = parseLongOrDefault(fields[8], -1L);
+                if (rx < 0 || tx < 0) {
+                    continue;
+                }
+                rxBytes += rx;
+                txBytes += tx;
+                netParsed = true;
+            } else if ("DISK".equals(section)) {
+                if (line.startsWith("Filesystem") || disks.size() >= 6) {
+                    continue;
+                }
+                String[] fields = line.split("\\s+");
+                if (fields.length < 6) {
+                    continue;
+                }
+                String filesystem = fields[0];
+                String mount = fields[5];
+                if (!filesystem.startsWith("/dev/")) {
+                    continue;
+                }
+                long total = parseLongOrDefault(fields[1], -1L);
+                long used = parseLongOrDefault(fields[2], -1L);
+                if (total <= 0 || used < 0) {
+                    continue;
+                }
+                ObjectNode disk = objectMapper.createObjectNode();
+                disk.put("mount", mount);
+                disk.put("total", total * 1024L);
+                disk.put("used", used * 1024L);
+                disk.put("usage", clampPercent(used * 100.0 / total));
+                disks.add(disk);
+            }
+        }
+
+        if (!cpuParsed && !memParsed) {
+            return null;
+        }
+
+        MonitorSample previous = connection.lastMonitorSample();
+        MonitorSample current = new MonitorSample(System.currentTimeMillis(), cpuTotal, cpuIdle, rxBytes, txBytes);
+        connection.updateMonitorSample(current);
+
+        // CPU 使用率必须由两次采样差值得出，首次采集只能返回 -1（前端显示占位符）
+        double cpuUsage = -1D;
+        if (previous != null && cpuTotal > previous.cpuTotal()) {
+            long totalDelta = cpuTotal - previous.cpuTotal();
+            long idleDelta = Math.max(0L, cpuIdle - previous.cpuIdle());
+            cpuUsage = clampPercent((totalDelta - idleDelta) * 100.0 / totalDelta);
+        }
+        double rxSpeed = -1D;
+        double txSpeed = -1D;
+        if (previous != null) {
+            double seconds = (current.timestamp() - previous.timestamp()) / 1000.0;
+            if (seconds >= 0.2) {
+                rxSpeed = Math.max(0D, (rxBytes - previous.rxBytes()) / seconds);
+                txSpeed = Math.max(0D, (txBytes - previous.txBytes()) / seconds);
+            }
+        }
+
+        long memUsed = 0L;
+        if (memParsed) {
+            memUsed = memAvailable >= 0
+                    ? Math.max(0L, memTotal - memAvailable)
+                    : Math.max(0L, memTotal - memFree - memBuffers - memCached);
+        }
+
+        ObjectNode json = objectMapper.createObjectNode();
+        json.put("type", "monitor_stats");
+        json.put("supported", true);
+        json.put("timestamp", current.timestamp());
+
+        ObjectNode cpu = json.putObject("cpu");
+        cpu.put("usage", cpuUsage);
+        cpu.put("cores", cores);
+        cpu.put("load1", load1);
+        cpu.put("load5", load5);
+        cpu.put("load15", load15);
+
+        ObjectNode memory = json.putObject("memory");
+        memory.put("total", memTotal);
+        memory.put("used", memUsed);
+        memory.put("usage", memTotal > 0 ? clampPercent(memUsed * 100.0 / memTotal) : -1D);
+        memory.put("swapTotal", swapTotal);
+        memory.put("swapUsed", Math.max(0L, swapTotal - swapFree));
+        memory.put("swapUsage", swapTotal > 0 ? clampPercent((swapTotal - swapFree) * 100.0 / swapTotal) : -1D);
+
+        ObjectNode network = json.putObject("network");
+        network.put("available", netParsed);
+        network.put("rxBytes", rxBytes);
+        network.put("txBytes", txBytes);
+        network.put("rxSpeed", rxSpeed);
+        network.put("txSpeed", txSpeed);
+
+        json.put("uptime", uptimeSeconds);
+        json.set("disks", disks);
+        return json;
+    }
+
+    /** 发送监控不可用消息（非 Linux 主机或采集失败），前端据此展示提示而非报错弹窗 */
+    private void sendMonitorUnavailable(WebSocketSession session, String message) {
+        ObjectNode json = objectMapper.createObjectNode();
+        json.put("type", "monitor_stats");
+        json.put("supported", false);
+        json.put("message", message);
+        sendJson(session, json);
+    }
+
+    /** 把百分比限制在 [0, 100] 并保留一位小数 */
+    private double clampPercent(double value) {
+        double clamped = Math.max(0D, Math.min(100D, value));
+        return Math.round(clamped * 10D) / 10D;
+    }
+
+    private long parseLongOrDefault(String text, long defaultValue) {
+        try {
+            return Long.parseLong(text.trim());
+        } catch (Exception e) {
+            return defaultValue;
+        }
+    }
+
+    private double parseDoubleOrDefault(String text, double defaultValue) {
+        try {
+            return Double.parseDouble(text.trim());
+        } catch (Exception e) {
+            return defaultValue;
+        }
     }
 
     // ==================== SSH 输出推送 ====================
@@ -1897,6 +2272,10 @@ public class SshWebSocketHandler extends TextWebSocketHandler {
         private final ConcurrentMap<String, PortForwardRule> forwardRules = new ConcurrentHashMap<>();
         private final ConcurrentMap<String, UploadContext> uploads = new ConcurrentHashMap<>();
         private final ConcurrentMap<String, DownloadState> downloads = new ConcurrentHashMap<>();
+        /** 监控采集进行中标记，防止慢网络下采集任务重叠堆积。 */
+        private final AtomicBoolean monitorSampling = new AtomicBoolean(false);
+        /** 上一次监控采样快照，用于计算 CPU 使用率与网络速率差值。 */
+        private volatile MonitorSample lastMonitorSample;
 
         private ClientConnection(WebSocketSession webSocketSession, String userKey) {
             this.webSocketSession = webSocketSession;
@@ -1943,7 +2322,33 @@ public class SshWebSocketHandler extends TextWebSocketHandler {
             this.forwardRules.clear();
             closeUploads();
             closeDownloads();
+            this.lastMonitorSample = null;
+            this.monitorSampling.set(false);
             shellOutputFilter.reset();
+        }
+
+        /**
+         * 尝试占用监控采集槽位。
+         *
+         * @return true 表示成功占用，false 表示已有采集在执行
+         */
+        private boolean beginMonitorSampling() {
+            return monitorSampling.compareAndSet(false, true);
+        }
+
+        /** 释放监控采集槽位。 */
+        private void endMonitorSampling() {
+            monitorSampling.set(false);
+        }
+
+        /** @return 上一次监控采样快照，首次采集时为 null */
+        private MonitorSample lastMonitorSample() {
+            return lastMonitorSample;
+        }
+
+        /** 记录本次监控采样快照，供下次差值计算使用。 */
+        private void updateMonitorSample(MonitorSample sample) {
+            this.lastMonitorSample = sample;
         }
 
         /** @return 是否已经进入关闭态 */
@@ -2131,6 +2536,8 @@ public class SshWebSocketHandler extends TextWebSocketHandler {
             sshSession = null;
             sftpSessionConfig = null;
             forwardRules.clear();
+            lastMonitorSample = null;
+            monitorSampling.set(false);
         }
 
         /** 内部静默关闭工具。 */
@@ -2144,6 +2551,19 @@ public class SshWebSocketHandler extends TextWebSocketHandler {
                 // ignore close exception
             }
         }
+    }
+
+
+    /**
+     * 监控采样快照 —— 保存上一次采集的累计值，用于计算 CPU 使用率与网络速率差值。
+     *
+     * @param timestamp 采样时刻（毫秒）
+     * @param cpuTotal  /proc/stat 首行各项累计和
+     * @param cpuIdle   /proc/stat 首行 idle + iowait 累计
+     * @param rxBytes   所有物理网卡累计接收字节数
+     * @param txBytes   所有物理网卡累计发送字节数
+     */
+    private record MonitorSample(long timestamp, long cpuTotal, long cpuIdle, long rxBytes, long txBytes) {
     }
 
 

@@ -159,6 +159,7 @@ const disconnectBtn = document.getElementById("disconnectBtn");
 const saveSessionBtn = document.getElementById("saveSessionBtn");
 const newTabBtn = document.getElementById("newTabBtn");
 const sftpToggleBtn = document.getElementById("sftpToggleBtn");
+const monitorToggleBtn = document.getElementById("monitorToggleBtn");
 const fullscreenBtn = document.getElementById("fullscreenBtn");
 const mobileKeybar = document.getElementById("mobileKeybar");
 const mobileKeybarToggle = document.getElementById("mobileKeybarToggle");
@@ -184,6 +185,32 @@ const sftpEls = {
     toggleBtn: sftpToggleBtn
 };
 
+// --- 服务器监控面板元素 ---
+const monitorEls = {
+    panel: document.getElementById("monitorPanel"),
+    toggleBtn: monitorToggleBtn,
+    closeBtn: document.getElementById("monitorCloseBtn"),
+    state: document.getElementById("monitorState"),
+    hint: document.getElementById("monitorHint"),
+    metrics: document.getElementById("monitorMetrics"),
+    cpuValue: document.getElementById("monitorCpuValue"),
+    cpuBar: document.getElementById("monitorCpuBar"),
+    cpuMeta: document.getElementById("monitorCpuMeta"),
+    memValue: document.getElementById("monitorMemValue"),
+    memBar: document.getElementById("monitorMemBar"),
+    memMeta: document.getElementById("monitorMemMeta"),
+    swapValue: document.getElementById("monitorSwapValue"),
+    swapBar: document.getElementById("monitorSwapBar"),
+    swapMeta: document.getElementById("monitorSwapMeta"),
+    rxSpeed: document.getElementById("monitorRxSpeed"),
+    txSpeed: document.getElementById("monitorTxSpeed"),
+    rxTotal: document.getElementById("monitorRxTotal"),
+    txTotal: document.getElementById("monitorTxTotal"),
+    diskList: document.getElementById("monitorDiskList"),
+    uptime: document.getElementById("monitorUptime"),
+    updatedAt: document.getElementById("monitorUpdatedAt")
+};
+
 // --- 端口转发面板元素 ---
 const forwardEls = {
     direction: document.getElementById("forwardDirection"),
@@ -204,6 +231,8 @@ const SFTP_UPLOAD_CHUNK_BYTES = 512 * 1024;
 const SFTP_UPLOAD_MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
 /** WebSocket 心跳间隔：20 秒，覆盖常见代理的 30-60 秒空闲断连阈值 */
 const WS_HEARTBEAT_INTERVAL_MS = 20 * 1000;
+/** 服务器监控采集间隔：3 秒 */
+const MONITOR_POLL_INTERVAL_MS = 3 * 1000;
 
 /** 所有打开的终端标签，key 为标签 ID */
 const tabs = new Map();
@@ -219,6 +248,8 @@ let sessionsCache = [];
 let sessionsLoaded = false;
 /** SFTP 面板是否处于打开状态 */
 let sftpPanelOpen = false;
+/** 服务器监控面板是否处于打开状态 */
+let monitorPanelOpen = false;
 /** 移动端快捷键栏的修饰键锁定状态 */
 const stickyMods = { ctrl: false, alt: false, shift: false };
 /** 记录键盘偏移，避免重复刷新 */
@@ -640,7 +671,11 @@ function makeTab(profile = {}) {
         downloadTask: null,
         uploadTask: null,
         lastShellCwd: null,
-        heartbeatTimer: null
+        heartbeatTimer: null,
+        monitorTimer: null,
+        monitorState: "idle",
+        monitorStateTextRaw: "",
+        monitorStats: null
     };
 
     term.onData((data) => {
@@ -735,6 +770,8 @@ function switchTab(id) {
     updateButtons();
     renderSftpEntries(tab);
     renderForwardList(tab);
+    renderMonitor(tab);
+    startMonitor(tab);
     if (sftpPanelOpen && tab.connected && (!tab.sftpEntries || tab.sftpEntries.length === 0)) {
         requestSftpList(tab, tab.profile.sftpPath || ".");
     }
@@ -761,6 +798,270 @@ function setSftpPanelVisible(show) {
     renderSftpState(tab);
     if (tab && sftpPanelOpen && tab.connected && (!tab.sftpEntries || tab.sftpEntries.length === 0)) {
         requestSftpList(tab, tab.profile.sftpPath || ".");
+    }
+
+    // 等待面板开合动画结束后重算终端尺寸。
+    setTimeout(() => {
+        const current = activeTab();
+        if (!current) {
+            return;
+        }
+        current.fitAddon.fit();
+        if (current.connected) {
+            sendResize(current);
+        }
+    }, 260);
+}
+
+// ==================== 服务器监控面板 ====================
+
+/** 把字节数格式化为带单位的可读文本（支持到 TB） */
+function formatMonitorBytes(bytes) {
+    const value = Number(bytes);
+    if (!Number.isFinite(value) || value < 0) {
+        return "--";
+    }
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let size = value;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+    }
+    return `${unitIndex === 0 ? size : size.toFixed(1)}${units[unitIndex]}`;
+}
+
+/** 把每秒字节数格式化为速率文本 */
+function formatMonitorSpeed(bytesPerSecond) {
+    const value = Number(bytesPerSecond);
+    if (!Number.isFinite(value) || value < 0) {
+        return "--";
+    }
+    return `${formatMonitorBytes(value)}/s`;
+}
+
+/** 把百分比格式化为文本，负值视为暂无数据 */
+function formatMonitorPercent(percent) {
+    const value = Number(percent);
+    if (!Number.isFinite(value) || value < 0) {
+        return "--";
+    }
+    return `${value.toFixed(1)}%`;
+}
+
+/** 把秒数格式化为「x天 x小时 x分」 */
+function formatMonitorUptime(seconds) {
+    const total = Math.floor(Number(seconds));
+    if (!Number.isFinite(total) || total < 0) {
+        return "--";
+    }
+    const days = Math.floor(total / 86400);
+    const hours = Math.floor((total % 86400) / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    if (days > 0) {
+        return t("monitor.uptimeValue.dhm", { days, hours, minutes });
+    }
+    if (hours > 0) {
+        return t("monitor.uptimeValue.hm", { hours, minutes });
+    }
+    return t("monitor.uptimeValue.m", { minutes });
+}
+
+/** 按使用率高低给进度条着色 */
+function applyMonitorBar(barEl, percent) {
+    if (!barEl) {
+        return;
+    }
+    const value = Number(percent);
+    const valid = Number.isFinite(value) && value >= 0;
+    barEl.style.width = valid ? `${Math.min(100, value)}%` : "0";
+    barEl.classList.toggle("warn", valid && value >= 70 && value < 90);
+    barEl.classList.toggle("danger", valid && value >= 90);
+}
+
+function defaultMonitorStateText(state) {
+    if (state === "loading") {
+        return t("monitor.state.loading");
+    }
+    if (state === "ok") {
+        return t("monitor.state.ok");
+    }
+    if (state === "error") {
+        return t("monitor.state.error");
+    }
+    return t("monitor.state.idle");
+}
+
+function setMonitorState(tab, state, text = "") {
+    if (!tab) {
+        return;
+    }
+    tab.monitorState = state || "idle";
+    tab.monitorStateTextRaw = text || "";
+    if (activeTabId === tab.id) {
+        renderMonitorState(tab);
+    }
+}
+
+function renderMonitorState(tab = activeTab()) {
+    if (!monitorEls.state) {
+        return;
+    }
+    let state = "idle";
+    let text = defaultMonitorStateText(state);
+    if (tab && tab.connected) {
+        state = tab.monitorState || "idle";
+        text = tab.monitorStateTextRaw ? localizeText(tab.monitorStateTextRaw) : defaultMonitorStateText(state);
+    }
+    monitorEls.state.className = `monitor-state monitor-state-${state}`;
+    monitorEls.state.textContent = text;
+}
+
+/** 渲染监控指标区域；无数据时展示提示文案 */
+function renderMonitor(tab = activeTab()) {
+    renderMonitorState(tab);
+    if (!monitorEls.metrics || !monitorEls.hint) {
+        return;
+    }
+
+    const stats = tab && tab.connected ? tab.monitorStats : null;
+    if (!stats) {
+        monitorEls.metrics.hidden = true;
+        monitorEls.hint.hidden = false;
+        if (!tab || !tab.connected) {
+            monitorEls.hint.textContent = t("monitor.hint.idle");
+        } else if (tab.monitorState === "error") {
+            monitorEls.hint.textContent = tab.monitorStateTextRaw
+                ? localizeText(tab.monitorStateTextRaw)
+                : t("monitor.hint.unsupported");
+        } else {
+            monitorEls.hint.textContent = t("monitor.hint.loading");
+        }
+        return;
+    }
+
+    monitorEls.hint.hidden = true;
+    monitorEls.metrics.hidden = false;
+
+    const cpu = stats.cpu || {};
+    monitorEls.cpuValue.textContent = formatMonitorPercent(cpu.usage);
+    applyMonitorBar(monitorEls.cpuBar, cpu.usage);
+    const loadText = [cpu.load1, cpu.load5, cpu.load15]
+        .map((item) => (Number.isFinite(Number(item)) && Number(item) >= 0 ? Number(item).toFixed(2) : "--"))
+        .join(" / ");
+    monitorEls.cpuMeta.textContent = `${t("monitor.cores", { cores: Number(cpu.cores) > 0 ? cpu.cores : "--" })} · ${t("monitor.load")} ${loadText}`;
+
+    const memory = stats.memory || {};
+    monitorEls.memValue.textContent = formatMonitorPercent(memory.usage);
+    applyMonitorBar(monitorEls.memBar, memory.usage);
+    monitorEls.memMeta.textContent = `${formatMonitorBytes(memory.used)} / ${formatMonitorBytes(memory.total)}`;
+
+    const swapTotal = Number(memory.swapTotal) || 0;
+    monitorEls.swapValue.textContent = swapTotal > 0 ? formatMonitorPercent(memory.swapUsage) : "--";
+    applyMonitorBar(monitorEls.swapBar, swapTotal > 0 ? memory.swapUsage : -1);
+    monitorEls.swapMeta.textContent = swapTotal > 0
+        ? `${formatMonitorBytes(memory.swapUsed)} / ${formatMonitorBytes(swapTotal)}`
+        : t("monitor.swapDisabled");
+
+    const network = stats.network || {};
+    monitorEls.rxSpeed.textContent = formatMonitorSpeed(network.rxSpeed);
+    monitorEls.txSpeed.textContent = formatMonitorSpeed(network.txSpeed);
+    monitorEls.rxTotal.textContent = formatMonitorBytes(network.rxBytes);
+    monitorEls.txTotal.textContent = formatMonitorBytes(network.txBytes);
+
+    const disks = Array.isArray(stats.disks) ? stats.disks : [];
+    if (disks.length === 0) {
+        monitorEls.diskList.innerHTML = `<div class="monitor-disk-empty">${escapeHtml(t("monitor.diskEmpty"))}</div>`;
+    } else {
+        monitorEls.diskList.innerHTML = disks.map((disk) => `
+            <div class="monitor-disk-item">
+                <div class="monitor-disk-row">
+                    <span class="monitor-disk-mount" title="${escapeHtml(disk.mount || "")}">${escapeHtml(disk.mount || "-")}</span>
+                    <span>${escapeHtml(formatMonitorPercent(disk.usage))}</span>
+                </div>
+                <div class="monitor-bar">
+                    <div class="monitor-bar-fill${Number(disk.usage) >= 90 ? " danger" : (Number(disk.usage) >= 70 ? " warn" : "")}" style="width:${Math.min(100, Math.max(0, Number(disk.usage) || 0))}%"></div>
+                </div>
+                <div class="monitor-disk-row">
+                    <span>${escapeHtml(formatMonitorBytes(disk.used))} / ${escapeHtml(formatMonitorBytes(disk.total))}</span>
+                </div>
+            </div>
+        `).join("");
+    }
+
+    monitorEls.uptime.textContent = formatMonitorUptime(stats.uptime);
+    monitorEls.updatedAt.textContent = Number(stats.timestamp) > 0
+        ? new Date(Number(stats.timestamp)).toLocaleTimeString()
+        : "--";
+}
+
+/** 向后端请求一次监控采样 */
+function requestMonitorStats(tab) {
+    if (!isSocketReady(tab)) {
+        return;
+    }
+    sendWs(tab, { type: "monitor_stats" });
+}
+
+/** 停止指定标签的监控轮询 */
+function stopMonitor(tab) {
+    if (!tab || !tab.monitorTimer) {
+        return;
+    }
+    clearInterval(tab.monitorTimer);
+    tab.monitorTimer = null;
+}
+
+/** 启动指定标签的监控轮询（仅在面板打开且连接可用时） */
+function startMonitor(tab) {
+    stopMonitor(tab);
+    if (!tab || !monitorPanelOpen || !isSocketReady(tab)) {
+        return;
+    }
+    if (!tab.monitorStats) {
+        setMonitorState(tab, "loading");
+        renderMonitor(tab);
+    }
+    requestMonitorStats(tab);
+    tab.monitorTimer = setInterval(() => {
+        if (!monitorPanelOpen || !isSocketReady(tab)) {
+            stopMonitor(tab);
+            return;
+        }
+        requestMonitorStats(tab);
+    }, MONITOR_POLL_INTERVAL_MS);
+}
+
+/** 清理标签的监控状态（断开连接时调用） */
+function resetMonitor(tab) {
+    if (!tab) {
+        return;
+    }
+    stopMonitor(tab);
+    tab.monitorStats = null;
+    tab.monitorState = "idle";
+    tab.monitorStateTextRaw = "";
+    if (activeTabId === tab.id) {
+        renderMonitor(tab);
+    }
+}
+
+/** 切换监控面板的显示/隐藏状态，动画结束后重算终端尺寸 */
+function setMonitorPanelVisible(show) {
+    monitorPanelOpen = !!show;
+    if (monitorEls.panel) {
+        monitorEls.panel.classList.toggle("open", monitorPanelOpen);
+    }
+    if (monitorEls.toggleBtn) {
+        monitorEls.toggleBtn.classList.toggle("active", monitorPanelOpen);
+    }
+
+    const tab = activeTab();
+    renderMonitor(tab);
+    if (monitorPanelOpen) {
+        startMonitor(tab);
+    } else {
+        tabs.forEach((item) => stopMonitor(item));
     }
 
     // 等待面板开合动画结束后重算终端尺寸。
@@ -878,6 +1179,7 @@ function closeTab(id) {
         tab.sftpConnectTimeout = null;
     }
     disconnectTab(tab, false);
+    stopMonitor(tab);
     tab.term.dispose();
     tab.pane.remove();
     tabs.delete(id);
@@ -1057,6 +1359,7 @@ function updateButtons() {
         saveSessionBtn.disabled = true;
         sftpActionButtons.forEach((btn) => { btn.disabled = true; });
         renderSftpState(null);
+        renderMonitorState(null);
         return;
     }
     connectBtn.disabled = tab.connected;
@@ -1069,6 +1372,7 @@ function updateButtons() {
         .filter(Boolean)
         .forEach((btn) => { btn.disabled = !tab.connected; });
     renderSftpState(tab);
+    renderMonitorState(tab);
 }
 
 // ==================== WebSocket 通信 ====================
@@ -1947,6 +2251,7 @@ function connectActiveTab() {
                     sftpEls.path.value = initialSftpPath;
                 }
                 requestSftpList(tab, initialSftpPath);
+                startMonitor(tab);
                 return;
             }
 
@@ -2070,6 +2375,20 @@ function connectActiveTab() {
                 return;
             }
 
+            if (msg.type === "monitor_stats") {
+                if (msg.supported === false) {
+                    tab.monitorStats = null;
+                    setMonitorState(tab, "error", msg.message || "");
+                } else {
+                    tab.monitorStats = msg;
+                    setMonitorState(tab, "ok");
+                }
+                if (activeTabId === tab.id) {
+                    renderMonitor(tab);
+                }
+                return;
+            }
+
             if (msg.type === "disconnected") {
                 const wasConnected = tab.connected;
                 tab.connected = false;
@@ -2094,6 +2413,7 @@ function connectActiveTab() {
                 renderTabs();
                 renderSftpEntries(tab);
                 renderForwardList(tab);
+                resetMonitor(tab);
                 safeCloseSocket(tab);
                 return;
             }
@@ -2137,6 +2457,7 @@ function connectActiveTab() {
         renderTabs();
         renderSftpEntries(tab);
         renderForwardList(tab);
+        resetMonitor(tab);
     };
 
     socket.onerror = () => {
@@ -2200,6 +2521,7 @@ function disconnectTab(tab, updateUi = true) {
     renderTabs();
     renderSftpEntries(tab);
     renderForwardList(tab);
+    resetMonitor(tab);
     if (updateUi) {
         updateButtons();
     }
@@ -2554,6 +2876,7 @@ function rerenderForLanguageChange() {
     renderSftpState(tab);
     renderSftpEntries(tab);
     renderForwardList(tab);
+    renderMonitor(tab);
     if (tab) {
         renderStatus(tab);
     }
@@ -2650,6 +2973,12 @@ async function bootstrap() {
     }
     if (sftpEls.closeBtn) {
         sftpEls.closeBtn.addEventListener("click", () => setSftpPanelVisible(false));
+    }
+    if (monitorEls.toggleBtn) {
+        monitorEls.toggleBtn.addEventListener("click", () => setMonitorPanelVisible(!monitorPanelOpen));
+    }
+    if (monitorEls.closeBtn) {
+        monitorEls.closeBtn.addEventListener("click", () => setMonitorPanelVisible(false));
     }
     if (fullscreenBtn) {
         fullscreenBtn.addEventListener("click", () => {
@@ -2761,6 +3090,7 @@ async function bootstrap() {
     }
 
     setSftpPanelVisible(false);
+    setMonitorPanelVisible(false);
     createAndSwitchTab();
     updateButtons();
     bindMobileKeybar();
